@@ -1,0 +1,13 @@
+diff --git a/ip/iproute.c b/ip/iproute.c
+index 25a56d1..1be9baa 100644
+--- a/ip/iproute.c
++++ b/ip/iproute.c
+@@ -614,6 +614,8 @@ int print_route(const struct sockaddr_nl *who, struct nlmsghdr *n, void *arg)
+ 			}
+ 			if (nh->rtnh_flags & RTNH_F_DEAD)
+ 				fprintf(fp, " dead");
++			if (nh->rtnh_flags & 8) /* RTNH_F_NEIGH_DOWN */
++				fprintf(fp, " neighdown ");
+ 			if (nh->rtnh_flags & RTNH_F_ONLINK)
+ 				fprintf(fp, " onlink");
+ 			if (nh->rtnh_flags & RTNH_F_PERVASIVE)

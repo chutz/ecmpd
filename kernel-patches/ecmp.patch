@@ -1,0 +1,150 @@
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index 9922093..a8ef33c 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -291,6 +291,7 @@ int ip_fib_check_default(__be32 gw, struct net_device *dev);
+ int fib_sync_down_dev(struct net_device *dev, int force);
+ int fib_sync_down_addr(struct net *net, __be32 local);
+ int fib_sync_up(struct net_device *dev);
++void fib_neigh_update(struct neighbour *neigh);
+ void fib_select_multipath(struct fib_result *res);
+ 
+ /* Exported by fib_trie.c */
+diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
+index eb0f1a5..5e054f4 100644
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@ -326,6 +326,8 @@ struct rtnexthop {
+ #define RTNH_F_DEAD		1	/* Nexthop is dead (used by multipath)	*/
+ #define RTNH_F_PERVASIVE	2	/* Do recursive gateway lookup	*/
+ #define RTNH_F_ONLINK		4	/* Gateway is forced on link	*/
++#define RTNH_F_NEIGH_DOWN	8	/* Neighbour failed (used by multipath)	*/
++#define RTNH_F_BAD_STATE	(RTNH_F_DEAD | RTNH_F_NEIGH_DOWN)
+ 
+ /* Macros to handle hexthops */
+ 
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index c7539e2..765e615 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -45,6 +45,7 @@
+ #include <net/ip_fib.h>
+ #include <net/rtnetlink.h>
+ #include <net/xfrm.h>
++#include <net/netevent.h>
+ 
+ #ifndef CONFIG_IP_MULTIPLE_TABLES
+ 
+@@ -1072,6 +1073,23 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
+ 	return NOTIFY_DONE;
+ }
+ 
++#ifdef CONFIG_IP_ROUTE_MULTIPATH
++
++static int fib_neigh_event(struct notifier_block *this, unsigned long event, void *ptr)
++{
++	struct neighbour *neigh = ptr;
++
++	if (event == NETEVENT_NEIGH_UPDATE && neigh->tbl == &arp_tbl)
++		fib_neigh_update(neigh);
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block fib_netevent_notifier = {
++	.notifier_call = fib_neigh_event,
++};
++
++#endif
++
+ static struct notifier_block fib_inetaddr_notifier = {
+ 	.notifier_call = fib_inetaddr_event,
+ };
+@@ -1174,6 +1192,9 @@ void __init ip_fib_init(void)
+ 	register_pernet_subsys(&fib_net_ops);
+ 	register_netdevice_notifier(&fib_netdev_notifier);
+ 	register_inetaddr_notifier(&fib_inetaddr_notifier);
++#ifdef CONFIG_IP_ROUTE_MULTIPATH
++	register_netevent_notifier(&fib_netevent_notifier);
++#endif
+ 
+ 	fib_trie_init();
+ }
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index b53f0bf..4ba9c2f 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -265,7 +265,7 @@ static inline int nh_comp(const struct fib_info *fi, const struct fib_info *ofi)
+ #ifdef CONFIG_IP_ROUTE_CLASSID
+ 		    nh->nh_tclassid != onh->nh_tclassid ||
+ #endif
+-		    ((nh->nh_flags ^ onh->nh_flags) & ~RTNH_F_DEAD))
++		    ((nh->nh_flags ^ onh->nh_flags) & ~RTNH_F_BAD_STATE))
+ 			return -1;
+ 		onh++;
+ 	} endfor_nexthops(fi);
+@@ -1278,6 +1278,47 @@ int fib_sync_up(struct net_device *dev)
+ 	return ret;
+ }
+ 
++void fib_neigh_update(struct neighbour *neigh)
++{
++	struct net_device *dev = neigh->dev;
++	struct net *net = dev_net(dev);
++	unsigned int hash;
++	struct hlist_head *head;
++	struct fib_nh *nh;
++
++	spin_lock_bh(&fib_info_lock);
++
++	hash = fib_devindex_hashfn(dev->ifindex);
++	head = &fib_info_devhash[hash];
++
++	hlist_for_each_entry(nh, head, nh_hash) {
++		struct fib_info *fi = nh->nh_parent;
++
++		if (fi->fib_nhs <= 1 || nh->nh_dev != dev ||
++		    memcmp(neigh->primary_key, &nh->nh_gw, sizeof(nh->nh_gw)))
++			continue;
++
++		if (neigh->nud_state == NUD_FAILED &&
++		    !(nh->nh_flags & RTNH_F_NEIGH_DOWN)) {
++			spin_lock_bh(&fib_multipath_lock);
++			nh->nh_flags |= RTNH_F_NEIGH_DOWN;
++			fi->fib_power -= nh->nh_power;
++			nh->nh_power = 0;
++			spin_unlock_bh(&fib_multipath_lock);
++			rt_cache_flush(net);
++		} else if (neigh->nud_state & NUD_VALID &&
++			   nh->nh_flags & RTNH_F_NEIGH_DOWN) {
++			spin_lock_bh(&fib_multipath_lock);
++			nh->nh_flags &= ~RTNH_F_NEIGH_DOWN;
++			nh->nh_power = 0;
++			spin_unlock_bh(&fib_multipath_lock);
++			/* no rt cache flush */
++		}
++	}
++
++	spin_unlock_bh(&fib_info_lock);
++}
++
+ /*
+  * The algorithm is suboptimal, but it provides really
+  * fair weighted route distribution.
+@@ -1291,7 +1332,7 @@ void fib_select_multipath(struct fib_result *res)
+ 	if (fi->fib_power <= 0) {
+ 		int power = 0;
+ 		change_nexthops(fi) {
+-			if (!(nexthop_nh->nh_flags & RTNH_F_DEAD)) {
++			if (!(nexthop_nh->nh_flags & RTNH_F_BAD_STATE)) {
+ 				power += nexthop_nh->nh_weight;
+ 				nexthop_nh->nh_power = nexthop_nh->nh_weight;
+ 			}
+@@ -1313,7 +1354,7 @@ void fib_select_multipath(struct fib_result *res)
+ 	w = jiffies % fi->fib_power;
+ 
+ 	change_nexthops(fi) {
+-		if (!(nexthop_nh->nh_flags & RTNH_F_DEAD) &&
++		if (!(nexthop_nh->nh_flags & RTNH_F_BAD_STATE) &&
+ 		    nexthop_nh->nh_power) {
+ 			w -= nexthop_nh->nh_power;
+ 			if (w <= 0) {
